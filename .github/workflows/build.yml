@@ -23,9 +23,18 @@ jobs:
     - name: Build Solution
       run: msbuild nxconvert.sln /p:Configuration=Release /p:Platform=x64
 
+    - name: Prepare Artifact
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force dist | Out-Null
+        Copy-Item x64/Release/nxconvert.exe dist/nxconvert.exe
+        @'
+        [Settings]
+        keys=
+        '@ | Set-Content -Encoding ASCII dist/nxconvert.sample.ini
+
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: build-output
-        # Adjust 'x64/Release/' to match your actual output folder
-        path: x64/Release/
+        name: nxconvert-windows-x64
+        path: dist/
