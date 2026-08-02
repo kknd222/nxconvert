@@ -1,0 +1,10 @@
+﻿build-mingw/
+x64/
+Debug/
+Release/
+*.user
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.log
