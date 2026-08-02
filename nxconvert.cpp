@@ -2157,7 +2157,7 @@ void ClearLog(HWND hwnd)
     HWND log = GetDlgItem(hwnd, IDC_LOG);
     if (log)
     {
-        SetWindowText(log, L"");
+        SetWindowTextA(log, "");
     }
 }
 
