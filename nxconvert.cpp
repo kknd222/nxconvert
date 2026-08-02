@@ -19,17 +19,83 @@
 #include <commctrl.h>
 #include <shlwapi.h>
 #include <shobjidl.h>
+#include <shellapi.h>
 #include "resource.h"
 
 #pragma comment(lib, "Comctl32.lib")
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "Ole32.lib")
+#pragma comment(lib, "Shell32.lib")
 
 void ShowError(HWND hwnd, const std::string& message);
 void LogMessage(HWND hwnd, const std::string& message);
 
 // Namespace alias for filesystem
 namespace fs = std::filesystem;
+
+static std::string g_initial_input_file;
+static constexpr const char* kDefaultKeyPath = "D:\\Citron-Windows-Canary-Refresh_0.6.1\\user11\\keys\\prod.keys";
+
+std::string WideToUtf8(const std::wstring& value)
+{
+    if (value.empty()) return {};
+    int size = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (size <= 0) return {};
+    std::string result(size - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, result.data(), size, nullptr, nullptr);
+    return result;
+}
+
+std::string GetExeDirectory()
+{
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, path, MAX_PATH);
+    return fs::path(path).parent_path().string();
+}
+
+std::string GetIniPath()
+{
+    return (fs::path(GetExeDirectory()) / "nxconvert.ini").string();
+}
+
+std::string ReadIniString(const char* key, const char* default_value = "")
+{
+    char value[MAX_PATH] = {};
+    GetPrivateProfileStringA("Settings", key, default_value, value, MAX_PATH, GetIniPath().c_str());
+    return value;
+}
+
+void WriteIniStringValue(const char* key, const std::string& value)
+{
+    WritePrivateProfileStringA("Settings", key, value.c_str(), GetIniPath().c_str());
+}
+
+std::string ParentDirectoryOf(const std::string& file)
+{
+    if (file.empty()) return {};
+    return fs::path(file).parent_path().string();
+}
+
+void ApplyInputDefaults(HWND hwnd, const std::string& input_file)
+{
+    if (input_file.empty()) return;
+    SetDlgItemTextA(hwnd, IDC_INPUT, input_file.c_str());
+    std::string out = ParentDirectoryOf(input_file);
+    if (!out.empty()) {
+        SetDlgItemTextA(hwnd, IDC_OUTPUT, out.c_str());
+    }
+}
+
+void LoadCommandLineInput()
+{
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) return;
+    if (argc >= 2) {
+        g_initial_input_file = WideToUtf8(argv[1]);
+    }
+    LocalFree(argv);
+}
 
 // ---------------- Partition struct ----------------
 struct Partition {
@@ -845,9 +911,11 @@ void decrypt_aes_ctr_section(
             return;
         }
         g_decrypt_progress.current_partition_bytes += chunk;
-        int percent = static_cast<int>(
-            ((g_decrypt_progress.processed_bytes + g_decrypt_progress.current_partition_bytes) * 100) /
-            g_decrypt_progress.total_bytes);
+        int percent = g_decrypt_progress.total_bytes == 0
+            ? 0
+            : static_cast<int>(
+                ((g_decrypt_progress.processed_bytes + g_decrypt_progress.current_partition_bytes) * 100) /
+                g_decrypt_progress.total_bytes);
         SendMessage(
             progress,
             PBM_SETPOS,
@@ -1844,6 +1912,13 @@ bool convert_nsp(HWND hwnd,
     uint64_t string_table_offset = 0x10 + file_count * 0x18;
     uint64_t data_offset = string_table_offset + string_table_size;
 
+    g_decrypt_progress.total_bytes = 0;
+    g_decrypt_progress.processed_bytes = 0;
+    g_decrypt_progress.current_partition_bytes = 0;
+    for (const auto& e : entries) {
+        g_decrypt_progress.total_bytes += e.size;
+    }
+
     // ---- Pass 1: load tickets ----
     for (auto& e : entries) {
         fin.seekg(string_table_offset + e.name_offset);
@@ -1986,9 +2061,11 @@ bool convert_xci(HWND hwnd, const std::string& input_path, const std::string& ou
         g_decrypt_progress.current_partition_bytes = 0;
         decrypt_partition(hwnd, fin, fout, hfs0_offset, p.offset, p.size, p.name, keys);
         g_decrypt_progress.processed_bytes += p.size;
-        int percent = static_cast<int>(
-            (g_decrypt_progress.processed_bytes * 100) /
-            g_decrypt_progress.total_bytes);
+        int percent = g_decrypt_progress.total_bytes == 0
+            ? 0
+            : static_cast<int>(
+                (g_decrypt_progress.processed_bytes * 100) /
+                g_decrypt_progress.total_bytes);
         SendMessage(
             progress,
             PBM_SETPOS,
@@ -2158,6 +2235,12 @@ INT_PTR CALLBACK MainDlgProc(
         SendMessage(GetDlgItem(hwnd, IDC_LOG), EM_SETLIMITTEXT, 0x7FFFFFFE, 0);
         SetUiBusy(hwnd, false);
 
+        std::string keyPath = ReadIniString("keys", kDefaultKeyPath);
+        if (!keyPath.empty()) {
+            SetDlgItemTextA(hwnd, IDC_KEYS, keyPath.c_str());
+        }
+        ApplyInputDefaults(hwnd, g_initial_input_file);
+
         return TRUE;
     }
     case WM_LOG_MESSAGE:
@@ -2265,6 +2348,8 @@ INT_PTR CALLBACK MainDlgProc(
                     return TRUE;
                 }
 
+                WriteIniStringValue("keys", key_file);
+
                 ConvertContext* ctx = new ConvertContext();
 
                 ctx->hwnd = hwnd;
@@ -2307,6 +2392,13 @@ INT_PTR CALLBACK MainDlgProc(
                         hwnd,
                         IDC_INPUT,
                         filePath);
+                    std::string outputDir = ParentDirectoryOf(filePath);
+                    if (!outputDir.empty()) {
+                        SetDlgItemTextA(
+                            hwnd,
+                            IDC_OUTPUT,
+                            outputDir.c_str());
+                    }
                 }
                 else
                 {
@@ -2391,6 +2483,7 @@ INT_PTR CALLBACK MainDlgProc(
                         hwnd,
                         IDC_KEYS,
                         filePath);
+                    WriteIniStringValue("keys", filePath);
                 }
                 else
                 {
@@ -2420,6 +2513,8 @@ int WINAPI WinMain(
     icc.dwSize = sizeof(icc);
     icc.dwICC = ICC_PROGRESS_CLASS;
     InitCommonControlsEx(&icc);
+
+    LoadCommandLineInput();
 
     DialogBoxParam(
         hInst,
