@@ -1955,9 +1955,30 @@ bool convert_nsp(HWND hwnd,
                 e.size
             };
 
+            g_decrypt_progress.current_partition_bytes = 0;
             decrypt_nca(hwnd, fin, fout, fake, keys);
+            g_decrypt_progress.processed_bytes += e.size;
+            g_decrypt_progress.current_partition_bytes = 0;
+
+            int percent = g_decrypt_progress.total_bytes == 0
+                ? 0
+                : static_cast<int>(
+                    (g_decrypt_progress.processed_bytes * 100) /
+                    g_decrypt_progress.total_bytes);
+            SendMessage(
+                GetDlgItem(hwnd, IDC_PROGRESS),
+                PBM_SETPOS,
+                percent,
+                0);
         }
     }
+
+    SendMessage(
+        GetDlgItem(hwnd, IDC_PROGRESS),
+        PBM_SETPOS,
+        100,
+        0);
+    LogMessage(hwnd, StrBuilder{} << "[INFO] NSP conversion complete\n");
 
     return true;
 }
