@@ -12,11 +12,18 @@
 #include <array>
 #include <iomanip>
 #include <cctype>
+#include <cwctype>
 #include <stdexcept>
+#include <memory>
+#include <cstdio>
+#include <algorithm>
+#include <chrono>
+#include <system_error>
 #include <mbedtls/aes.h>
 #include <mbedtls/cipher.h>
 #include <Windows.h>
 #include <commctrl.h>
+#include <commdlg.h>
 #include <shlwapi.h>
 #include <shobjidl.h>
 #include <shellapi.h>
@@ -70,10 +77,160 @@ void WriteIniStringValue(const char* key, const std::string& value)
     WritePrivateProfileStringA("Settings", key, value.c_str(), GetIniPath().c_str());
 }
 
+fs::path NativePath(const std::string& value);
+std::string PathToUtf8(const fs::path& value);
+
 std::string ParentDirectoryOf(const std::string& file)
 {
     if (file.empty()) return {};
-    return fs::path(file).parent_path().string();
+    return PathToUtf8(NativePath(file).parent_path());
+}
+
+std::wstring Utf8ToWide(const std::string& value)
+{
+    if (value.empty()) return {};
+    int size = MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, nullptr, 0);
+    if (size <= 0) return {};
+    std::wstring result(size - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, result.data(), size);
+    return result;
+}
+
+fs::path NativePath(const std::string& value)
+{
+    return fs::path(Utf8ToWide(value));
+}
+
+std::string PathToUtf8(const fs::path& value)
+{
+    return WideToUtf8(value.wstring());
+}
+
+std::string LowerAscii(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+std::string LowerExtension(const std::string& path)
+{
+    return LowerAscii(PathToUtf8(NativePath(path).extension()));
+}
+
+bool HasExtension(const std::string& path, const std::string& ext)
+{
+    return LowerExtension(path) == ext;
+}
+
+fs::path MakeTempDirectory(const std::string& prefix)
+{
+    fs::path root = fs::temp_directory_path();
+    auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    DWORD pid = GetCurrentProcessId();
+
+    for (int i = 0; i < 100; ++i) {
+        fs::path dir = root / (prefix + "-" + std::to_string(pid) + "-" +
+            std::to_string(now) + "-" + std::to_string(i));
+        std::error_code ec;
+        if (fs::create_directory(dir, ec)) {
+            return dir;
+        }
+    }
+
+    throw std::runtime_error("Failed to create a temporary directory.");
+}
+
+struct TempDirectory
+{
+    fs::path path;
+
+    explicit TempDirectory(fs::path value) : path(std::move(value)) {}
+
+    ~TempDirectory()
+    {
+        if (!path.empty()) {
+            std::error_code ec;
+            fs::remove_all(path, ec);
+        }
+    }
+};
+
+std::wstring QuoteCommandArg(const std::wstring& arg)
+{
+    if (arg.empty()) return L"\"\"";
+
+    bool needs_quotes = false;
+    for (wchar_t ch : arg) {
+        if (std::iswspace(ch) || ch == L'"') {
+            needs_quotes = true;
+            break;
+        }
+    }
+
+    if (!needs_quotes) return arg;
+
+    std::wstring result = L"\"";
+    int backslashes = 0;
+    for (wchar_t ch : arg) {
+        if (ch == L'\\') {
+            ++backslashes;
+        } else if (ch == L'"') {
+            result.append(backslashes * 2 + 1, L'\\');
+            result.push_back(ch);
+            backslashes = 0;
+        } else {
+            result.append(backslashes, L'\\');
+            backslashes = 0;
+            result.push_back(ch);
+        }
+    }
+    result.append(backslashes * 2, L'\\');
+    result.push_back(L'"');
+    return result;
+}
+
+bool RunProcessAndWait(
+    const std::wstring& executable,
+    const std::vector<std::wstring>& args,
+    DWORD& exit_code)
+{
+    std::wstring command_line = QuoteCommandArg(executable);
+    for (const auto& arg : args) {
+        command_line.push_back(L' ');
+        command_line += QuoteCommandArg(arg);
+    }
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+
+    std::vector<wchar_t> mutable_command(command_line.begin(), command_line.end());
+    mutable_command.push_back(L'\0');
+
+    BOOL ok = CreateProcessW(
+        nullptr,
+        mutable_command.data(),
+        nullptr,
+        nullptr,
+        TRUE,
+        0,
+        nullptr,
+        nullptr,
+        &si,
+        &pi);
+
+    if (!ok) {
+        return false;
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    exit_code = 1;
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
 }
 
 void ApplyInputDefaults(HWND hwnd, const std::string& input_file)
@@ -759,12 +916,13 @@ std::vector<uint8_t> get_title_kek_key(const KeyStore& keys, const NcaHeader& nc
 
 // Check if file is a valid XCI
 bool is_xci_file(const std::string& path) {
-    if (!fs::exists(path)) return false;
+    fs::path native_path = NativePath(path);
+    if (!fs::exists(native_path)) return false;
 
-    auto size = fs::file_size(path);
+    auto size = fs::file_size(native_path);
     if (size < 0x104) return false;  // must be at least 0x104 bytes
 
-    std::ifstream fin(path, std::ios::binary);
+    std::ifstream fin(native_path, std::ios::binary);
     if (!fin) return false;
 
     fin.seekg(0x100, std::ios::beg);
@@ -775,12 +933,20 @@ bool is_xci_file(const std::string& path) {
 }
 
 bool is_nsp_file(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
+    std::ifstream f(NativePath(path), std::ios::binary);
     if (!f) return false;
 
     char magic[4];
     f.read(magic, 4);
     return std::string(magic, 4) == "PFS0";
+}
+
+bool is_nsz_file(const std::string& path) {
+    return HasExtension(path, ".nsz");
+}
+
+bool is_xcz_file(const std::string& path) {
+    return HasExtension(path, ".xcz");
 }
 
 std::vector<uint8_t> transcode_data(const std::vector<uint8_t>& data, const std::vector<uint8_t>& key) {
@@ -827,7 +993,10 @@ std::vector<uint8_t> get_content_key(HWND hwnd, const NcaHeader& nca_header, con
         keyslots[i] = std::vector<uint8_t>(dec_key_area.begin() + i * 16, dec_key_area.begin() + (i + 1) * 16);
     }
 
-    // Find the non-zero key slot (there should be exactly one)
+    // Find the non-zero key slots. Older NCAs usually have exactly one
+    // populated slot, but some newer/gamecard-built content can carry several
+    // populated slots. In that case choose the slot selected by the NCA header
+    // key_area_key_index instead of aborting.
     std::vector<std::pair<int, std::vector<uint8_t>>> non_zero;
     for (int i = 0; i < 4; ++i) {
         if (std::any_of(keyslots[i].begin(), keyslots[i].end(), [](uint8_t b) { return b != 0; })) {
@@ -835,12 +1004,27 @@ std::vector<uint8_t> get_content_key(HWND hwnd, const NcaHeader& nca_header, con
         }
     }
 
-    if (non_zero.size() != 1) {
-        ShowError(hwnd, StrBuilder{} << "[FATAL] Expected exactly 1 content key, found " << non_zero.size() << "\n");
+    if (non_zero.empty()) {
+        ShowError(hwnd, StrBuilder{} << "[FATAL] No non-zero content key found\n");
         std::exit(1);
     }
 
-    return non_zero[0].second;  // Return the content key (the only non-zero key)
+    if (non_zero.size() == 1) {
+        return non_zero[0].second;
+    }
+
+    int preferred = static_cast<int>(nca_header.key_area_key_index);
+    if (preferred >= 0 && preferred < 4 &&
+        std::any_of(keyslots[preferred].begin(), keyslots[preferred].end(), [](uint8_t b) { return b != 0; })) {
+        LogMessage(hwnd, StrBuilder{} << "[INFO] Multiple content keys found (" << non_zero.size()
+            << "), using key_area_key_index slot " << preferred << "\n");
+        return keyslots[preferred];
+    }
+
+    LogMessage(hwnd, StrBuilder{} << "[INFO] Multiple content keys found (" << non_zero.size()
+        << "), key_area_key_index slot " << preferred
+        << " is empty/invalid; using first non-zero slot " << non_zero[0].first << "\n");
+    return non_zero[0].second;
 }
 
 void decrypt_aes_ctr_section(
@@ -1857,25 +2041,26 @@ bool convert_nsp(HWND hwnd,
     KeyStore& keys, 
     bool overwrite)
 {
-    fs::path output_path = fs::path(output_dir) / (name + ".dnsp");
+    fs::path input_native = NativePath(input_path);
+    fs::path output_path = NativePath(output_dir) / Utf8ToWide(name + ".dnsp");
 
     if (fs::exists(output_path)) {
         if (!overwrite)
         {
             throw std::runtime_error(
-                "Output file already exists: " + output_path.string());
+                "Output file already exists: " + PathToUtf8(output_path));
         }
 
         fs::remove(output_path);
     }
     fs::create_directories(output_dir);
-    CopyFileWithProgress(hwnd, input_path, output_path);
+    CopyFileWithProgress(hwnd, input_native, output_path);
     if (g_cancel_decrypt)
     {
         return false;
     }
 
-    std::ifstream fin(input_path, std::ios::binary);
+    std::ifstream fin(input_native, std::ios::binary);
     std::fstream fout(output_path, std::ios::binary | std::ios::in | std::ios::out);
 
     if (!fin || !fout)
@@ -1955,9 +2140,30 @@ bool convert_nsp(HWND hwnd,
                 e.size
             };
 
+            g_decrypt_progress.current_partition_bytes = 0;
             decrypt_nca(hwnd, fin, fout, fake, keys);
+            g_decrypt_progress.processed_bytes += e.size;
+            g_decrypt_progress.current_partition_bytes = 0;
+
+            int percent = g_decrypt_progress.total_bytes == 0
+                ? 0
+                : static_cast<int>(
+                    (g_decrypt_progress.processed_bytes * 100) /
+                    g_decrypt_progress.total_bytes);
+            SendMessage(
+                GetDlgItem(hwnd, IDC_PROGRESS),
+                PBM_SETPOS,
+                percent,
+                0);
         }
     }
+
+    SendMessage(
+        GetDlgItem(hwnd, IDC_PROGRESS),
+        PBM_SETPOS,
+        100,
+        0);
+    LogMessage(hwnd, StrBuilder{} << "[INFO] NSP conversion complete\n");
 
     return true;
 }
@@ -1977,28 +2183,29 @@ uint64_t PartitionsSize(
 // ---------------- Convert XCI ----------------
 bool convert_xci(HWND hwnd, const std::string& input_path, const std::string& output_dir, const std::string& name, KeyStore& keys, bool overwrite) {
     const std::string new_ext = ".dxci";
-    fs::path output_path = fs::path(output_dir) / (name + new_ext);
+    fs::path input_native = NativePath(input_path);
+    fs::path output_path = NativePath(output_dir) / Utf8ToWide(name + new_ext);
 
     // Overwrite prompt
     if (fs::exists(output_path)) {
         if (!overwrite)
         {
             throw std::runtime_error(
-                "Output file already exists: " + output_path.string());
+                "Output file already exists: " + PathToUtf8(output_path));
         }
 
         fs::remove(output_path);
     }
 
     fs::create_directories(output_dir);
-    CopyFileWithProgress(hwnd,input_path,output_path);
+    CopyFileWithProgress(hwnd, input_native, output_path);
     if (g_cancel_decrypt)
     {
         return false;
     }
     LogMessage(hwnd, StrBuilder{} << "decrypting " << input_path << " ...\n");
 
-    std::ifstream fin(input_path, std::ios::binary);
+    std::ifstream fin(input_native, std::ios::binary);
     std::fstream fout(output_path, std::ios::binary | std::ios::in | std::ios::out);
 
     if (!fin || !fout) throw std::runtime_error("Failed to open input/output files.");
@@ -2076,10 +2283,147 @@ bool convert_xci(HWND hwnd, const std::string& input_path, const std::string& ou
     return true;
 }
 
+bool TryRunNszDecompressor(
+    HWND hwnd,
+    const std::string& input_path,
+    const std::string& output_dir,
+    const std::string& key_file)
+{
+    struct Candidate {
+        std::wstring executable;
+        std::vector<std::wstring> prefix_args;
+        std::string display_name;
+    };
+
+    std::vector<Candidate> candidates;
+    fs::path bundled_nsz = fs::path(GetExeDirectory()) / "nsz.exe";
+    candidates.push_back({ Utf8ToWide(bundled_nsz.string()), {}, bundled_nsz.string() });
+    candidates.push_back({ L"nsz.exe", {}, "nsz.exe from PATH" });
+    candidates.push_back({ L"python.exe", { L"-c", L"import nsz, sys; sys.exit(nsz.main())" }, "python package nsz" });
+    candidates.push_back({ L"py.exe", { L"-3", L"-c", L"import nsz, sys; sys.exit(nsz.main())" }, "py -3 package nsz" });
+
+    std::vector<std::wstring> common_args = {
+        L"-D",
+        L"--output",
+        Utf8ToWide(output_dir),
+        L"--overwrite"
+    };
+
+    if (!key_file.empty()) {
+        common_args.push_back(L"--keys");
+        common_args.push_back(Utf8ToWide(key_file));
+    }
+
+    common_args.push_back(Utf8ToWide(input_path));
+
+    bool launched_any = false;
+    DWORD last_exit_code = 1;
+
+    for (const auto& candidate : candidates) {
+        std::vector<std::wstring> args = candidate.prefix_args;
+        args.insert(args.end(), common_args.begin(), common_args.end());
+
+        LogMessage(hwnd, StrBuilder{} << "[INFO] Trying NSZ decompressor: "
+            << candidate.display_name << "\n");
+
+        DWORD exit_code = 1;
+        if (!RunProcessAndWait(candidate.executable, args, exit_code)) {
+            continue;
+        }
+
+        launched_any = true;
+        last_exit_code = exit_code;
+
+        if (exit_code == 0) {
+            return true;
+        }
+
+        LogMessage(hwnd, StrBuilder{} << "[INFO] Decompressor exited with code "
+            << exit_code << "\n");
+    }
+
+    if (!launched_any) {
+        throw std::runtime_error(
+            "NSZ/XCZ support needs the external NSZ decompressor. "
+            "Put nsz.exe next to nxconvert.exe, add nsz.exe to PATH, "
+            "or install the Python package with: python -m pip install nsz");
+    }
+
+    throw std::runtime_error(
+        "NSZ/XCZ decompression failed. Last decompressor exit code: " +
+        std::to_string(last_exit_code));
+}
+
+fs::path FindDecompressedContainer(const fs::path& dir, const std::string& preferred_ext)
+{
+    fs::path fallback;
+
+    for (const auto& entry : fs::recursive_directory_iterator(dir)) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+
+        std::string ext = LowerAscii(PathToUtf8(entry.path().extension()));
+        if (ext == preferred_ext) {
+            return entry.path();
+        }
+        if (fallback.empty() && (ext == ".nsp" || ext == ".xci")) {
+            fallback = entry.path();
+        }
+    }
+
+    return fallback;
+}
+
+bool convert_compressed_container(
+    HWND hwnd,
+    const std::string& input_path,
+    const std::string& output_dir,
+    const std::string& name,
+    KeyStore& keys,
+    bool overwrite,
+    const std::string& key_file)
+{
+    const bool xcz = is_xcz_file(input_path);
+    const std::string decompressed_ext = xcz ? ".xci" : ".nsp";
+    TempDirectory temp_dir(MakeTempDirectory("nxconvert-nsz"));
+
+    LogMessage(hwnd, StrBuilder{} << "[INFO] Decompressing "
+        << (xcz ? "XCZ" : "NSZ") << " to temporary "
+        << (xcz ? "XCI" : "NSP") << ": " << temp_dir.path.string() << "\n");
+
+    TryRunNszDecompressor(hwnd, input_path, temp_dir.path.string(), key_file);
+
+    fs::path decompressed = FindDecompressedContainer(temp_dir.path, decompressed_ext);
+    if (decompressed.empty()) {
+        throw std::runtime_error("NSZ/XCZ decompressor did not produce an NSP/XCI file.");
+    }
+
+    LogMessage(hwnd, StrBuilder{} << "[INFO] Decompressed container: "
+        << decompressed.string() << "\n");
+
+    if (xcz) {
+        return convert_xci(hwnd, PathToUtf8(decompressed), output_dir, name, keys, overwrite);
+    }
+
+    return convert_nsp(hwnd, PathToUtf8(decompressed), output_dir, name, keys, overwrite);
+}
+
 // Convert file, validating type first
-bool convert_file(HWND hwnd, const std::string& input_path, const std::string& output_dir, KeyStore& keys, bool overwrite) {
-    std::string base_name = fs::path(input_path).filename().string();
-    std::string name = fs::path(base_name).stem().string();
+bool convert_file(
+    HWND hwnd,
+    const std::string& input_path,
+    const std::string& output_dir,
+    KeyStore& keys,
+    bool overwrite,
+    const std::string& key_file = "") {
+    fs::path input_native = NativePath(input_path);
+    std::string base_name = PathToUtf8(input_native.filename());
+    std::string name = PathToUtf8(input_native.stem());
+
+    if (is_nsz_file(input_path) || is_xcz_file(input_path)) {
+        return convert_compressed_container(hwnd, input_path, output_dir, name, keys, overwrite, key_file);
+    }
 
     if (is_xci_file(input_path)) {
         return convert_xci(hwnd, input_path, output_dir, name, keys, overwrite);
@@ -2089,7 +2433,7 @@ bool convert_file(HWND hwnd, const std::string& input_path, const std::string& o
         return convert_nsp(hwnd, input_path, output_dir, name, keys, overwrite);
     }
 
-    throw std::runtime_error("Unsupported file type. Only valid XCI files are supported.");
+    throw std::runtime_error("Unsupported file type. Supported files: XCI, NSP, XCZ, NSZ.");
 }
 
 #define WM_CONVERT_DONE     (WM_APP + 1)
@@ -2098,12 +2442,198 @@ bool convert_file(HWND hwnd, const std::string& input_path, const std::string& o
 
 void ShowError(HWND hwnd, const std::string& message)
 {
+    if (!hwnd) {
+        std::cerr << message << std::endl;
+        return;
+    }
+
+    MessageBoxA(hwnd, message.c_str(), "NXConvert", MB_ICONERROR);
 }
 
 void LogMessage(HWND hwnd, const std::string& message)
 {
+    if (!hwnd) {
+        std::cout << message;
+        if (message.empty() || message.back() != '\n') {
+            std::cout << '\n';
+        }
+        std::cout.flush();
+        return;
+    }
+
     auto* str = new std::string(message);
     PostMessage(hwnd, WM_LOG_MESSAGE, 0, reinterpret_cast<LPARAM>(str));
+}
+
+struct CommandLineOptions
+{
+    bool cli = false;
+    bool help = false;
+    bool overwrite = false;
+    std::string input_file;
+    std::string output_dir;
+    std::string key_file;
+};
+
+void PrintUsage()
+{
+    std::cout
+        << "NXConvert\n\n"
+        << "GUI:\n"
+        << "  nxconvert.exe\n"
+        << "  nxconvert.exe <input.xci|input.nsp|input.xcz|input.nsz>    # prefill GUI\n\n"
+        << "CLI:\n"
+        << "  nxconvert.exe --cli -i <input.xci|input.nsp|input.xcz|input.nsz> -o <output_dir> -k <prod.keys> [--overwrite]\n"
+        << "  nxconvert.exe --cli <input.xci|input.nsp|input.xcz|input.nsz> [output_dir] [prod.keys] [--overwrite]\n\n"
+        << "Options:\n"
+        << "  -i, --input       Input XCI/NSP/XCZ/NSZ file\n"
+        << "  -o, --output      Output directory; default: input file directory\n"
+        << "  -k, --keys        prod.keys path; default: nxconvert.ini [Settings] keys\n"
+        << "  -y, --overwrite   Overwrite existing output\n"
+        << "  -h, --help        Show this help\n\n"
+        << "NSZ/XCZ input requires nsz.exe next to nxconvert.exe, nsz.exe in PATH, or Python package nsz.\n";
+}
+
+std::vector<std::string> GetCommandLineArgs()
+{
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    std::vector<std::string> args;
+    if (!argv) return args;
+    for (int i = 1; i < argc; ++i) {
+        args.push_back(WideToUtf8(argv[i]));
+    }
+    LocalFree(argv);
+    return args;
+}
+
+bool IsHelpArg(const std::string& arg)
+{
+    return arg == "-h" || arg == "--help" || arg == "/?";
+}
+
+CommandLineOptions ParseCommandLineOptions(const std::vector<std::string>& args)
+{
+    CommandLineOptions opt;
+    std::vector<std::string> positional;
+
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const std::string& arg = args[i];
+        auto require_value = [&](const char* name) -> std::string {
+            if (i + 1 >= args.size()) {
+                throw std::runtime_error(std::string("Missing value for ") + name);
+            }
+            return args[++i];
+        };
+
+        if (arg == "--cli" || arg == "/cli") {
+            opt.cli = true;
+        } else if (IsHelpArg(arg)) {
+            opt.help = true;
+            opt.cli = true;
+        } else if (arg == "-i" || arg == "--input") {
+            opt.input_file = require_value(arg.c_str());
+            opt.cli = true;
+        } else if (arg == "-o" || arg == "--output") {
+            opt.output_dir = require_value(arg.c_str());
+            opt.cli = true;
+        } else if (arg == "-k" || arg == "--keys") {
+            opt.key_file = require_value(arg.c_str());
+            opt.cli = true;
+        } else if (arg == "-y" || arg == "--overwrite" || arg == "/y") {
+            opt.overwrite = true;
+            opt.cli = true;
+        } else if (!arg.empty() && arg[0] == '-') {
+            throw std::runtime_error("Unknown option: " + arg);
+        } else {
+            positional.push_back(arg);
+        }
+    }
+
+    if (opt.input_file.empty() && !positional.empty()) {
+        opt.input_file = positional[0];
+    }
+    if (opt.output_dir.empty() && positional.size() >= 2) {
+        opt.output_dir = positional[1];
+    }
+    if (opt.key_file.empty() && positional.size() >= 3) {
+        opt.key_file = positional[2];
+    }
+
+    // Keep old behavior: a single positional argument without --cli opens the GUI prefilled.
+    if (!opt.cli && positional.size() >= 2) {
+        opt.cli = true;
+    }
+
+    return opt;
+}
+
+void AttachParentConsoleForCli()
+{
+    HANDLE stdout_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (stdout_handle &&
+        stdout_handle != INVALID_HANDLE_VALUE &&
+        GetFileType(stdout_handle) != FILE_TYPE_UNKNOWN)
+    {
+        return;
+    }
+
+    if (!AttachConsole(ATTACH_PARENT_PROCESS)) {
+        AllocConsole();
+    }
+    FILE* ignored = nullptr;
+    freopen_s(&ignored, "CONOUT$", "w", stdout);
+    freopen_s(&ignored, "CONOUT$", "w", stderr);
+    freopen_s(&ignored, "CONIN$", "r", stdin);
+}
+
+int RunCommandLine(const CommandLineOptions& opt)
+{
+    try {
+        if (opt.help) {
+            PrintUsage();
+            return 0;
+        }
+        if (opt.input_file.empty()) {
+            throw std::runtime_error("Missing input file. Use -i <file>.");
+        }
+        if (!fs::exists(NativePath(opt.input_file))) {
+            throw std::runtime_error("Input file does not exist: " + opt.input_file);
+        }
+
+        std::string output_dir = opt.output_dir.empty()
+            ? ParentDirectoryOf(opt.input_file)
+            : opt.output_dir;
+        if (output_dir.empty()) {
+            output_dir = ".";
+        }
+
+        std::string key_file = opt.key_file.empty()
+            ? ReadIniString("keys", kDefaultKeyPath)
+            : opt.key_file;
+        if (key_file.empty()) {
+            throw std::runtime_error("Missing keys file. Use -k <prod.keys> or set nxconvert.ini [Settings] keys.");
+        }
+        if (!fs::exists(NativePath(key_file))) {
+            throw std::runtime_error("Keys file does not exist: " + key_file);
+        }
+
+        std::cout << "[CLI] input:     " << opt.input_file << "\n";
+        std::cout << "[CLI] output:    " << output_dir << "\n";
+        std::cout << "[CLI] keys:      " << key_file << "\n";
+        std::cout << "[CLI] overwrite: " << (opt.overwrite ? "yes" : "no") << "\n";
+
+        g_cancel_decrypt = false;
+        KeyStore ks = load_keys(key_file);
+        bool ok = convert_file(nullptr, opt.input_file, output_dir, ks, opt.overwrite, key_file);
+        std::cout << (ok ? "[CLI] Conversion completed successfully.\n"
+                         : "[CLI] Conversion failed.\n");
+        return ok ? 0 : 2;
+    }
+    catch (const std::exception& e) {
+        std::cerr << "[CLI] Error: " << e.what() << "\n";
+        return 1;
+    }
 }
 
 struct ConvertContext
@@ -2136,7 +2666,7 @@ void ClearLog(HWND hwnd)
     HWND log = GetDlgItem(hwnd, IDC_LOG);
     if (log)
     {
-        SetWindowText(log, L"");
+        SetWindowTextA(log, "");
     }
 }
 
@@ -2155,7 +2685,8 @@ DWORD WINAPI ConvertThread(LPVOID param)
             ctx->input_file,
             ctx->output_dir,
             ks,
-            ctx->overwrite))
+            ctx->overwrite,
+            ctx->key_file))
         {
             PostMessage(
                 ctx->hwnd,
@@ -2379,7 +2910,7 @@ INT_PTR CALLBACK MainDlgProc(
             ofn.lpstrFile = filePath;
             ofn.nMaxFile = MAX_PATH;
             ofn.lpstrFilter =
-                "All Files\0*.*\0";
+                "Nintendo Switch containers\0*.xci;*.nsp;*.xcz;*.nsz\0All Files\0*.*\0";
             ofn.nFilterIndex = 1;
             ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
 
@@ -2509,12 +3040,36 @@ int WINAPI WinMain(
     LPSTR,
     int)
 {
+    std::vector<std::string> args = GetCommandLineArgs();
+    CommandLineOptions cli_options;
+    try {
+        cli_options = ParseCommandLineOptions(args);
+    }
+    catch (const std::exception&) {
+        AttachParentConsoleForCli();
+        try {
+            cli_options = ParseCommandLineOptions(args);
+        }
+        catch (const std::exception& e) {
+            std::cerr << "[CLI] Error: " << e.what() << "\n\n";
+            PrintUsage();
+            return 1;
+        }
+    }
+
+    if (cli_options.cli || cli_options.help) {
+        AttachParentConsoleForCli();
+        return RunCommandLine(cli_options);
+    }
+
     INITCOMMONCONTROLSEX icc{};
     icc.dwSize = sizeof(icc);
     icc.dwICC = ICC_PROGRESS_CLASS;
     InitCommonControlsEx(&icc);
 
-    LoadCommandLineInput();
+    if (!args.empty()) {
+        g_initial_input_file = args[0];
+    }
 
     DialogBoxParam(
         hInst,
